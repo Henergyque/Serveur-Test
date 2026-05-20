@@ -279,7 +279,12 @@ app.get('/v1/version', requireAdmin, (req, res) => {
   });
 });
 
-app.get('/v1/announcement', requireAdmin, (req, res) => {
+app.get('/v1/announcement', (req, res) => {
+  const authHeader = req.get('Authorization') || '';
+  const gameToken = req.get('X-Game-Token') || '';
+  const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
+  const isGame = GAME_TOKEN && gameToken === GAME_TOKEN;
+  if (!isAdmin && !isGame) return res.status(401).json({ error: 'unauthorized' });
   res.json({ announcement: currentAnnouncement() });
 });
 
