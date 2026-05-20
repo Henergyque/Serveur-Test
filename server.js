@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
   v TEXT
 );
+CREATE TABLE IF NOT EXISTS announcements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  url TEXT,
+  type TEXT DEFAULT 'info',
+  version TEXT,
+  expiresAt INTEGER,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
 `);
 
 const insertEvent = db.prepare(`
@@ -93,6 +104,39 @@ const endSession = db.prepare(`
 
 const getMeta = db.prepare(`SELECT v FROM meta WHERE k=?`);
 const setMeta = db.prepare(`INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`);
+
+const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, expiresAt, created_at FROM announcements WHERE active = 1 ORDER BY created_at DESC LIMIT 1`);
+const insertAnnouncement = db.prepare(`INSERT INTO announcements (title, body, url, type, version, expiresAt, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`);
+const deactivateAnnouncements = db.prepare(`UPDATE announcements SET active = 0 WHERE active = 1`);
+
+function currentAnnouncement() {
+  const row = getAnnouncement.get();
+  if (!row) return null;
+  if (row.expiresAt && row.expiresAt < Date.now()) return null;
+  return {
+    id: row.id,
+    title: row.title,
+    body: row.body,
+    url: row.url,
+    type: row.type,
+    version: row.version,
+    expiresAt: row.expiresAt,
+    createdAt: row.created_at
+  };
+}
+
+function publishAnnouncement({ title, body, url, type, version, expiresAt }) {
+  deactivateAnnouncements.run();
+  insertAnnouncement.run(
+    String(title || '').slice(0, 128),
+    String(body || '').slice(0, 2048),
+    url ? String(url).slice(0, 1024) : null,
+    String(type || 'info').slice(0, 32),
+    version ? String(version).slice(0, 32) : null,
+    expiresAt ? parseInt(expiresAt, 10) : null,
+    Date.now()
+  );
+}
 
 // ---------- App ----------
 const app = express();
@@ -222,6 +266,36 @@ function concurrentHistory(rangeMs, bucketMs) {
     ORDER BY bucket ASC
   `).all(bucketMs, bucketMs, since);
 }
+
+const LATEST_DASHBOARD_VERSION = process.env.DASHBOARD_LATEST_VERSION || '1.0.0';
+const DASHBOARD_RELEASE_URL = process.env.DASHBOARD_RELEASE_URL || '';
+const DASHBOARD_RELEASE_NOTES = process.env.DASHBOARD_RELEASE_NOTES || '';
+
+app.get('/v1/version', requireAdmin, (req, res) => {
+  res.json({
+    latest: LATEST_DASHBOARD_VERSION,
+    url: DASHBOARD_RELEASE_URL,
+    notes: DASHBOARD_RELEASE_NOTES
+  });
+});
+
+app.get('/v1/announcement', requireAdmin, (req, res) => {
+  res.json({ announcement: currentAnnouncement() });
+});
+
+app.post('/v1/announcement', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  if (!body.title || !body.body) {
+    return res.status(400).json({ error: 'title and body are required' });
+  }
+  publishAnnouncement(body);
+  res.json({ ok: true, announcement: currentAnnouncement() });
+});
+
+app.delete('/v1/announcement', requireAdmin, (req, res) => {
+  deactivateAnnouncements.run();
+  res.json({ ok: true });
+});
 
 app.get('/v1/stats/live', requireAdmin, (req, res) => res.json(liveStats()));
 app.get('/v1/stats/dropoff', requireAdmin, (req, res) => {
