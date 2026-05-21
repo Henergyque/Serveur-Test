@@ -333,6 +333,17 @@ app.delete('/v1/announcement', requireAdmin, (req, res) => {
 });
 
 app.get('/v1/stats/live', requireAdmin, (req, res) => res.json(liveStats()));
+
+app.get('/v1/players/zones', requireAdmin, (req, res) => {
+  const rows = db.prepare(`
+    SELECT player_id, last_zone FROM sessions s
+    WHERE last_seen = (SELECT MAX(last_seen) FROM sessions WHERE player_id = s.player_id)
+    GROUP BY player_id
+  `).all();
+  const result = {};
+  for (const row of rows) result[row.player_id] = row.last_zone || 'unknown';
+  res.json(result);
+});
 app.get('/v1/stats/dropoff', requireAdmin, (req, res) => {
   const range = parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10);
   res.json(dropoffStats(range));
