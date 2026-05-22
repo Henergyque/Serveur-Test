@@ -128,6 +128,7 @@ const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, 
 const incrementViewCount = db.prepare(`UPDATE announcements SET view_count = view_count + 1 WHERE id = ?`);
 const insertAnnouncement = db.prepare(`INSERT INTO announcements (title, body, url, type, version, expiresAt, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`);
 const deactivateAnnouncements = db.prepare(`UPDATE announcements SET active = 0 WHERE active = 1`);
+const getChangelog = db.prepare(`SELECT id, title, body, url, version, created_at FROM announcements ORDER BY created_at DESC LIMIT 20`);
 
 function currentAnnouncement() {
   const row = getAnnouncement.get();
@@ -347,6 +348,16 @@ app.post('/v1/announcement', requireAdmin, (req, res) => {
 app.delete('/v1/announcement', requireAdmin, (req, res) => {
   deactivateAnnouncements.run();
   res.json({ ok: true });
+});
+
+app.get('/v1/changelog', (req, res) => {
+  const authHeader = req.get('Authorization') || '';
+  const gameToken = req.get('X-Game-Token') || '';
+  const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
+  const isGame = GAME_TOKEN && gameToken === GAME_TOKEN;
+  if (!isAdmin && !isGame) return res.status(401).json({ error: 'unauthorized' });
+  const rows = getChangelog.all();
+  res.json({ changelog: rows.map(r => ({ id: r.id, title: r.title, body: r.body, url: r.url, version: r.version, createdAt: r.created_at })) });
 });
 
 app.get('/v1/stats/live', requireAdmin, (req, res) => res.json(liveStats()));
