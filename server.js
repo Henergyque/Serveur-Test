@@ -432,6 +432,20 @@ app.post('/v1/messages/:id/read', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/v1/chat', (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const uuid = String(req.query.uuid || '').slice(0, 64);
+  const partner = String(req.query.partner || '').slice(0, 64);
+  if (!uuid || !partner) return res.status(400).json({ error: 'uuid and partner required' });
+  const rows = db.prepare(`
+    SELECT id, from_uuid, to_uuid, body, ts, read_at FROM player_messages
+    WHERE (from_uuid = ? AND to_uuid = ?) OR (from_uuid = ? AND to_uuid = ?)
+    ORDER BY ts ASC LIMIT 200
+  `).all(uuid, partner, partner, uuid);
+  res.json({ messages: rows });
+});
+
 app.get('/v1/players/zones', requireAdmin, (req, res) => {
   const rows = db.prepare(`
     SELECT player_id, last_zone FROM sessions s
