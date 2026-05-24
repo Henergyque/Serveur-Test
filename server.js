@@ -20,6 +20,9 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 if (!GAME_TOKEN) console.warn('[boot] GAME_TOKEN env not set; /v1/event will reject everything.');
 if (!ADMIN_TOKEN) console.warn('[boot] ADMIN_TOKEN env not set; admin endpoints will reject everything.');
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isValidUUID = (s) => typeof s === 'string' && UUID_RE.test(s);
+
 // ---------- DB ----------
 try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
 const db = new Database(DB_PATH);
@@ -194,6 +197,7 @@ app.post('/v1/event', eventLimiter, (req, res) => {
       const pid = String(e.playerId || '').slice(0, 64);
       const type = String(e.type || '').slice(0, 32);
       if (!sid || !pid || !type) continue;
+      if (!isValidUUID(pid)) continue;
       const ts = Math.min(now, Math.max(now - 24*3600*1000, parseInt(e.ts || now, 10)));
       const mapId = Number.isFinite(e.mapId) ? parseInt(e.mapId, 10) : null;
       const zone = e.zone ? String(e.zone).slice(0, 32) : null;
@@ -372,7 +376,7 @@ app.post('/v1/report', gameLimiter, (req, res) => {
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   const b = req.body || {};
   db.prepare(`INSERT INTO bug_reports (player_id, error, stack, zone, version, platform, ts) VALUES (?,?,?,?,?,?,?)`).run(
-    String(b.playerId || '').slice(0, 64) || null,
+    isValidUUID(b.playerId) ? String(b.playerId) : null,
     String(b.error   || '').slice(0, 512),
     String(b.stack   || '').slice(0, 4096),
     String(b.zone    || '').slice(0, 32),
@@ -386,6 +390,7 @@ app.post('/v1/report', gameLimiter, (req, res) => {
 app.post('/v1/players/link', adminLimiter, requireAdmin, (req, res) => {
   const { uuid, discordUsername, discordId } = req.body || {};
   if (!uuid || !discordUsername) return res.status(400).json({ error: 'uuid and discordUsername required' });
+  if (!isValidUUID(uuid)) return res.status(400).json({ error: 'invalid uuid format' });
   db.prepare(`INSERT OR REPLACE INTO discord_links (player_id, discord_username, discord_id, linked_at) VALUES (?, ?, ?, ?)`)
     .run(String(uuid).slice(0, 64), String(discordUsername).slice(0, 64), discordId ? String(discordId).slice(0, 32) : null, Date.now());
   res.json({ ok: true });
@@ -399,8 +404,9 @@ app.get('/v1/players/links', adminLimiter, requireAdmin, (req, res) => {
 app.get('/v1/players/discord', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  const uuid = String(req.query.uuid || '').slice(0, 64);
+  const uuid = String(req.query.uuid || '');
   if (!uuid) return res.status(400).json({ error: 'uuid required' });
+  if (!isValidUUID(uuid)) return res.status(400).json({ error: 'invalid uuid format' });
   const row = db.prepare(`SELECT discord_username FROM discord_links WHERE player_id = ?`).get(uuid);
   res.json({ username: row ? row.discord_username : null });
 });
