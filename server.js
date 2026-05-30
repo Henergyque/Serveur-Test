@@ -228,6 +228,11 @@ app.post('/v1/event', eventLimiter, (req, res) => {
   res.json({ ok: true, accepted: events.length });
 });
 
+// ---------- Live endpoint (for dashboard polling fallback) ----------
+app.get('/v1/live', adminLimiter, requireAdmin, (req, res) => {
+  res.json({ live: liveStats() });
+});
+
 // ---------- Admin auth ----------
 function requireAdmin(req, res, next) {
   const h = req.get('Authorization') || '';
