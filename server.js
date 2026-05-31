@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
 CREATE INDEX IF NOT EXISTS idx_sessions_end_ts ON sessions(end_ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_player_id ON sessions(player_id);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
