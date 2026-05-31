@@ -366,6 +366,29 @@ app.delete('/v1/announcement', adminLimiter, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- Game auto-update ----------
+app.get('/v1/game/update', gameLimiter, (req, res) => {
+  const gameToken = req.get('X-Game-Token') || '';
+  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  const row = getMeta.get('game_update_manifest');
+  if (!row) return res.json({ manifest: null });
+  try { res.json({ manifest: JSON.parse(row.v) }); }
+  catch(e) { res.json({ manifest: null }); }
+});
+
+app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
+  const { manifest } = req.body || {};
+  if (!manifest || !manifest.version || !Array.isArray(manifest.files))
+    return res.status(400).json({ error: 'invalid manifest' });
+  setMeta.run('game_update_manifest', JSON.stringify(manifest));
+  res.json({ ok: true, manifest });
+});
+
+app.delete('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
+  setMeta.run('game_update_manifest', 'null');
+  res.json({ ok: true });
+});
+
 app.get('/v1/changelog', gameLimiter, (req, res) => {
   const authHeader = req.get('Authorization') || '';
   const gameToken = req.get('X-Game-Token') || '';
