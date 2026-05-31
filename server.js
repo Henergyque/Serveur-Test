@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS announcements (
 `);
 
 try { db.exec(`ALTER TABLE discord_links ADD COLUMN discord_id TEXT`); } catch(e) {}
+try { db.exec(`ALTER TABLE bug_reports ADD COLUMN screenshot TEXT`); } catch(e) {}
 
 const insertEvent = db.prepare(`
   INSERT INTO events (session_id, player_id, ts, type, map_id, zone, payload)
@@ -170,7 +171,7 @@ function publishAnnouncement({ title, body, url, type, version, expiresAt }) {
 // ---------- App ----------
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '512kb' }));
 
 const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 const gameLimiter  = rateLimit({ windowMs: 60 * 1000, max: 30 });
@@ -388,13 +389,14 @@ app.post('/v1/report', gameLimiter, (req, res) => {
   const gameToken = req.get('X-Game-Token') || '';
   if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   const b = req.body || {};
-  db.prepare(`INSERT INTO bug_reports (player_id, error, stack, zone, version, platform, ts) VALUES (?,?,?,?,?,?,?)`).run(
+  db.prepare(`INSERT INTO bug_reports (player_id, error, stack, zone, version, platform, screenshot, ts) VALUES (?,?,?,?,?,?,?,?)`).run(
     isValidUUID(b.playerId) ? String(b.playerId) : null,
-    String(b.error   || '').slice(0, 512),
-    String(b.stack   || '').slice(0, 4096),
-    String(b.zone    || '').slice(0, 32),
-    String(b.version || '').slice(0, 32),
-    String(b.platform|| '').slice(0, 32),
+    String(b.error      || '').slice(0, 512),
+    String(b.stack      || '').slice(0, 4096),
+    String(b.zone       || '').slice(0, 32),
+    String(b.version    || '').slice(0, 32),
+    String(b.platform   || '').slice(0, 32),
+    String(b.screenshot || '').slice(0, 200000),
     Date.now()
   );
   res.json({ ok: true });
@@ -436,7 +438,7 @@ app.get('/v1/players/zones', adminLimiter, requireAdmin, (req, res) => {
 });
 app.get('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-  const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, ts FROM bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
+  const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, screenshot, ts FROM bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
   res.json({ reports: rows });
 });
 
