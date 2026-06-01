@@ -96,8 +96,11 @@ CREATE TABLE IF NOT EXISTS announcements (
   version TEXT,
   expiresAt INTEGER,
   active INTEGER NOT NULL DEFAULT 1,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  view_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_bug_reports_ts ON bug_reports(ts);
+CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at);
 `);
 
 try { db.exec(`ALTER TABLE discord_links ADD COLUMN discord_id TEXT`); } catch(e) {}
@@ -452,9 +455,8 @@ app.get('/v1/players/discord', gameLimiter, (req, res) => {
 
 app.get('/v1/players/zones', adminLimiter, requireAdmin, (req, res) => {
   const rows = db.prepare(`
-    SELECT player_id, last_zone FROM sessions s
-    WHERE last_seen = (SELECT MAX(last_seen) FROM sessions WHERE player_id = s.player_id)
-    GROUP BY player_id
+    SELECT player_id, last_zone FROM sessions
+    GROUP BY player_id HAVING last_seen = MAX(last_seen)
   `).all();
   const result = {};
   for (const row of rows) result[row.player_id] = row.last_zone || 'unknown';
@@ -472,12 +474,12 @@ app.delete('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
 });
 
 app.get('/v1/stats/dropoff', adminLimiter, requireAdmin, (req, res) => {
-  const range = parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10);
+  const range = Math.max(1, Math.min(parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
   res.json(dropoffStats(range));
 });
 app.get('/v1/stats/concurrent', adminLimiter, requireAdmin, (req, res) => {
-  const range = parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10);
-  const bucket = parseInt(req.query.bucketMs || (5 * 60 * 1000), 10);
+  const range  = Math.max(1, Math.min(parseInt(req.query.rangeMs  || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
+  const bucket = Math.max(60000, Math.min(parseInt(req.query.bucketMs || (5 * 60 * 1000), 10), 24 * 3600 * 1000));
   res.json(concurrentHistory(range, bucket));
 });
 
