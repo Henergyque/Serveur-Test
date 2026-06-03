@@ -1,534 +1,219 @@
 'use strict';
-// v1.1.0
+
+const http    = require('http');
 const express = require('express');
-const rateLimit = require('express-rate-limit');
-const Database = require('better-sqlite3');
-const http = require('http');
 const { WebSocketServer } = require('ws');
-const path = require('path');
-const fs = require('fs');
 
-// ---------- Config (env) ----------
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT       = process.env.PORT || 3001;
 const GAME_TOKEN = process.env.GAME_TOKEN || '';
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-const DB_DIR = process.env.DB_DIR || '/data';
-const DB_PATH = path.join(DB_DIR, 'telemetry.db');
-const ACTIVE_WINDOW_MS = 2 * 60 * 1000; // session counted "online" if event within 2 min
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || '';
 
-if (!GAME_TOKEN) console.warn('[boot] GAME_TOKEN env not set; /v1/event will reject everything.');
-if (!ADMIN_TOKEN) console.warn('[boot] ADMIN_TOKEN env not set; admin endpoints will reject everything.');
+const app    = express();
+const server = http.createServer(app);
+const wss    = new WebSocketServer({ server });
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const isValidUUID = (s) => typeof s === 'string' && UUID_RE.test(s);
+// players : playerId → { ws, lobbyId, ready, mapId, x, y, dir, characterName, characterIndex, lastSeen }
+const players = new Map();
+// lobbies : lobbyId → { id, ownerId, members: Set<playerId>, started }
+const lobbies = new Map();
 
-// ---------- DB ----------
-try { fs.mkdirSync(DB_DIR, { recursive: true }); } catch (e) {}
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-try { db.exec(`ALTER TABLE announcements ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0`); } catch (e) {}
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS sessions (
-  id TEXT PRIMARY KEY,
-  player_id TEXT NOT NULL,
-  start_ts INTEGER NOT NULL,
-  end_ts INTEGER,
-  last_seen INTEGER NOT NULL,
-  last_map_id INTEGER,
-  last_zone TEXT,
-  version TEXT,
-  platform TEXT,
-  locale TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
-CREATE INDEX IF NOT EXISTS idx_sessions_end_ts ON sessions(end_ts);
-CREATE INDEX IF NOT EXISTS idx_sessions_player_id ON sessions(player_id);
-
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id TEXT NOT NULL,
-  player_id TEXT NOT NULL,
-  ts INTEGER NOT NULL,
-  type TEXT NOT NULL,
-  map_id INTEGER,
-  zone TEXT,
-  payload TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
-CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
-CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
-
-CREATE TABLE IF NOT EXISTS concurrent_snapshots (
-  ts INTEGER PRIMARY KEY,
-  count INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS meta (
-  k TEXT PRIMARY KEY,
-  v TEXT
-);
-CREATE TABLE IF NOT EXISTS bug_reports (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  player_id TEXT,
-  error TEXT,
-  stack TEXT,
-  zone TEXT,
-  version TEXT,
-  platform TEXT,
-  ts INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS discord_links (
-  player_id TEXT PRIMARY KEY,
-  discord_username TEXT NOT NULL,
-  discord_id TEXT,
-  linked_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS announcements (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  title TEXT NOT NULL,
-  body TEXT NOT NULL,
-  url TEXT,
-  type TEXT DEFAULT 'info',
-  version TEXT,
-  expiresAt INTEGER,
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at INTEGER NOT NULL,
-  view_count INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_bug_reports_ts ON bug_reports(ts);
-CREATE INDEX IF NOT EXISTS idx_announcements_created ON announcements(created_at);
-`);
-
-try { db.exec(`ALTER TABLE discord_links ADD COLUMN discord_id TEXT`); } catch(e) {}
-try { db.exec(`ALTER TABLE bug_reports ADD COLUMN screenshot TEXT`); } catch(e) {}
-
-const insertEvent = db.prepare(`
-  INSERT INTO events (session_id, player_id, ts, type, map_id, zone, payload)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
-`);
-
-const upsertSessionStart = db.prepare(`
-  INSERT INTO sessions (id, player_id, start_ts, last_seen, last_map_id, last_zone, version, platform, locale)
-  VALUES (@id, @player_id, @ts, @ts, NULL, NULL, @version, @platform, @locale)
-  ON CONFLICT(id) DO UPDATE SET last_seen=@ts, version=COALESCE(@version, version), platform=COALESCE(@platform, platform), locale=COALESCE(@locale, locale)
-`);
-
-const updateSessionTick = db.prepare(`
-  UPDATE sessions SET last_seen=@ts, last_map_id=COALESCE(@map_id, last_map_id), last_zone=COALESCE(@zone, last_zone)
-  WHERE id=@id
-`);
-
-const ensureSessionRow = db.prepare(`
-  INSERT OR IGNORE INTO sessions (id, player_id, start_ts, last_seen, last_map_id, last_zone)
-  VALUES (@id, @player_id, @ts, @ts, @map_id, @zone)
-`);
-
-const endSession = db.prepare(`
-  UPDATE sessions SET end_ts=@ts, last_seen=@ts, last_map_id=COALESCE(@map_id, last_map_id), last_zone=COALESCE(@zone, last_zone)
-  WHERE id=@id
-`);
-
-const getMeta = db.prepare(`SELECT v FROM meta WHERE k=?`);
-const setMeta = db.prepare(`INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`);
-
-const getAnnouncement = db.prepare(`SELECT id, title, body, url, type, version, expiresAt, created_at, view_count FROM announcements WHERE active = 1 ORDER BY created_at DESC LIMIT 1`);
-const incrementViewCount = db.prepare(`UPDATE announcements SET view_count = view_count + 1 WHERE id = ?`);
-const insertAnnouncement = db.prepare(`INSERT INTO announcements (title, body, url, type, version, expiresAt, active, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`);
-const deactivateAnnouncements = db.prepare(`UPDATE announcements SET active = 0 WHERE active = 1`);
-const getChangelog = db.prepare(`SELECT id, title, body, url, version, created_at FROM announcements ORDER BY created_at DESC LIMIT 20`);
-
-function currentAnnouncement() {
-  const row = getAnnouncement.get();
-  if (!row) return null;
-  if (row.expiresAt && row.expiresAt < Date.now()) return null;
-  return {
-    id: row.id,
-    title: row.title,
-    body: row.body,
-    url: row.url,
-    type: row.type,
-    version: row.version,
-    expiresAt: row.expiresAt,
-    createdAt: row.created_at,
-    viewCount: row.view_count || 0
-  };
+function genLobbyId() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let id;
+  do {
+    id = Array.from({ length: 4 }, () => chars[Math.random() * chars.length | 0]).join('');
+  } while (lobbies.has(id));
+  return id;
 }
 
-function publishAnnouncement({ title, body, url, type, version, expiresAt }) {
-  deactivateAnnouncements.run();
-  insertAnnouncement.run(
-    String(title || '').slice(0, 128),
-    String(body || '').slice(0, 2048),
-    url ? String(url).slice(0, 1024) : null,
-    String(type || 'info').slice(0, 32),
-    version ? String(version).slice(0, 32) : null,
-    expiresAt ? parseInt(expiresAt, 10) : null,
-    Date.now()
-  );
+function sendTo(playerId, payload) {
+  const p = players.get(playerId);
+  if (p && p.ws.readyState === 1) p.ws.send(JSON.stringify(payload));
 }
 
-// ---------- App ----------
-const app = express();
-app.set('trust proxy', 1);
-app.use(express.json({ limit: '512kb' }));
+function broadcastLobbyUpdate(lobbyId) {
+  const lobby = lobbies.get(lobbyId);
+  if (!lobby) return;
+  const members = Array.from(lobby.members).map(pid => {
+    const p = players.get(pid);
+    return { playerId: pid, ready: p ? p.ready : false, isOwner: pid === lobby.ownerId };
+  });
+  const payload = { type: 'lobby_update', lobbyId, members };
+  lobby.members.forEach(pid => sendTo(pid, payload));
+}
 
-const eventLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
-const gameLimiter  = rateLimit({ windowMs: 60 * 1000, max: 30 });
-const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
+function dissolve(lobbyId, excludeId) {
+  const lobby = lobbies.get(lobbyId);
+  if (!lobby) return;
+  lobby.members.forEach(pid => {
+    if (pid !== excludeId) sendTo(pid, { type: 'lobby_dissolved' });
+    const p = players.get(pid);
+    if (p) p.lobbyId = null;
+  });
+  lobbies.delete(lobbyId);
+}
 
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// ---------- Ingest ----------
-app.post('/v1/event', eventLimiter, (req, res) => {
-  if (!GAME_TOKEN || req.get('X-Game-Token') !== GAME_TOKEN) {
-    return res.status(401).json({ error: 'invalid token' });
-  }
-  const body = req.body || {};
-  const events = Array.isArray(body.events) ? body.events : [];
-  if (events.length === 0) return res.json({ ok: true, accepted: 0 });
-  if (events.length > 50) return res.status(413).json({ error: 'batch too large' });
-
-  const now = Date.now();
-  let dirtyTypes = new Set();
-
-  const tx = db.transaction((list) => {
-    for (const e of list) {
-      if (!e || typeof e !== 'object') continue;
-      const sid = String(e.sessionId || '').slice(0, 64);
-      const pid = String(e.playerId || '').slice(0, 64);
-      const type = String(e.type || '').slice(0, 32);
-      if (!sid || !pid || !type) continue;
-      if (!isValidUUID(pid)) continue;
-      const ts = Math.min(now, Math.max(now - 24*3600*1000, parseInt(e.ts || now, 10)));
-      const mapId = Number.isFinite(e.mapId) ? parseInt(e.mapId, 10) : null;
-      const zone = e.zone ? String(e.zone).slice(0, 32) : null;
-      const payload = JSON.stringify(e);
-
-      insertEvent.run(sid, pid, ts, type, mapId, zone, payload);
-
-      if (type === 'session_start') {
-        upsertSessionStart.run({
-          id: sid, player_id: pid, ts,
-          version: e.version ? String(e.version).slice(0, 32) : null,
-          platform: e.platform ? String(e.platform).slice(0, 32) : null,
-          locale: e.locale ? String(e.locale).slice(0, 16) : null
-        });
-      } else if (type === 'session_end') {
-        ensureSessionRow.run({ id: sid, player_id: pid, ts, map_id: mapId, zone });
-        endSession.run({ id: sid, ts, map_id: mapId, zone });
+function handleDisconnect(playerId) {
+  const player = players.get(playerId);
+  if (!player) return;
+  if (player.lobbyId) {
+    const lobby = lobbies.get(player.lobbyId);
+    if (lobby) {
+      if (lobby.ownerId === playerId) {
+        dissolve(player.lobbyId, playerId);
       } else {
-        ensureSessionRow.run({ id: sid, player_id: pid, ts, map_id: mapId, zone });
-        updateSessionTick.run({ id: sid, ts, map_id: mapId, zone });
+        lobby.members.delete(playerId);
+        broadcastLobbyUpdate(lobby.id);
       }
-      dirtyTypes.add(type);
+    }
+  }
+  players.delete(playerId);
+}
+
+// ─── HTTP ────────────────────────────────────────────────────────────────────
+
+app.get('/health', (_req, res) => res.json({ ok: true, lobbies: lobbies.size, players: players.size }));
+
+// ─── WebSocket ───────────────────────────────────────────────────────────────
+
+wss.on('connection', (ws) => {
+  let playerId = null;
+  let authed   = false;
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    // ── Auth (first message) ──
+    if (!authed) {
+      if (msg.type !== 'auth') return;
+      if (GAME_TOKEN && msg.gameToken !== GAME_TOKEN) { ws.close(4001, 'unauthorized'); return; }
+      if (!msg.playerId) { ws.close(4002, 'missing playerId'); return; }
+      playerId = String(msg.playerId).slice(0, 64);
+      authed = true;
+      // If same playerId reconnects, replace old entry
+      const old = players.get(playerId);
+      if (old && old.ws !== ws) try { old.ws.terminate(); } catch {}
+      players.set(playerId, {
+        ws, lobbyId: null, ready: false,
+        mapId: 0, x: 0, y: 0, dir: 2,
+        characterName: '', characterIndex: 0,
+        lastSeen: Date.now()
+      });
+      return;
+    }
+
+    const player = players.get(playerId);
+    if (!player) return;
+    player.lastSeen = Date.now();
+
+    switch (msg.type) {
+
+      case 'create_lobby': {
+        if (player.lobbyId) return;
+        const id = genLobbyId();
+        lobbies.set(id, { id, ownerId: playerId, members: new Set([playerId]), started: false });
+        player.lobbyId = id;
+        player.ready   = false;
+        sendTo(playerId, { type: 'lobby_created', lobbyId: id });
+        break;
+      }
+
+      case 'join_lobby': {
+        if (player.lobbyId) return;
+        const lobbyId = String(msg.lobbyId || '').toUpperCase().slice(0, 4);
+        const lobby   = lobbies.get(lobbyId);
+        if (!lobby)                { sendTo(playerId, { type: 'lobby_error', message: 'Lobby introuvable.' }); return; }
+        if (lobby.members.size >= 2) { sendTo(playerId, { type: 'lobby_error', message: 'Lobby plein (max 2 joueurs).' }); return; }
+        if (lobby.started)         { sendTo(playerId, { type: 'lobby_error', message: 'Partie déjà commencée.' }); return; }
+        lobby.members.add(playerId);
+        player.lobbyId = lobbyId;
+        player.ready   = false;
+        broadcastLobbyUpdate(lobbyId);
+        break;
+      }
+
+      case 'ready': {
+        if (!player.lobbyId) return;
+        player.ready = !player.ready;
+        broadcastLobbyUpdate(player.lobbyId);
+        break;
+      }
+
+      case 'start': {
+        const lobby = lobbies.get(player.lobbyId);
+        if (!lobby || lobby.ownerId !== playerId) return;
+        if (lobby.members.size < 2) { sendTo(playerId, { type: 'lobby_error', message: 'En attente d\'un 2e joueur.' }); return; }
+        const allReady = Array.from(lobby.members).every(pid => { const p = players.get(pid); return p && p.ready; });
+        if (!allReady) { sendTo(playerId, { type: 'lobby_error', message: 'Les deux joueurs doivent être prêts.' }); return; }
+        lobby.started = true;
+        lobby.members.forEach(pid => sendTo(pid, { type: 'game_start', lobbyId: player.lobbyId }));
+        break;
+      }
+
+      case 'pos': {
+        if (!player.lobbyId) return;
+        player.mapId          = Number(msg.mapId)          || 0;
+        player.x              = Number(msg.x)              || 0;
+        player.y              = Number(msg.y)              || 0;
+        player.dir            = Number(msg.dir)            || 2;
+        player.characterName  = String(msg.characterName  || '').slice(0, 64);
+        player.characterIndex = Number(msg.characterIndex) || 0;
+
+        const lobby = lobbies.get(player.lobbyId);
+        if (!lobby) return;
+
+        const positions = Array.from(lobby.members).map(pid => {
+          const p = players.get(pid);
+          if (!p) return null;
+          return { playerId: pid, mapId: p.mapId, x: p.x, y: p.y, dir: p.dir, characterName: p.characterName, characterIndex: p.characterIndex };
+        }).filter(Boolean);
+
+        lobby.members.forEach(pid => {
+          if (pid !== playerId) sendTo(pid, { type: 'positions', players: positions });
+        });
+        break;
+      }
+
+      case 'leave_lobby': {
+        if (!player.lobbyId) return;
+        const lobby = lobbies.get(player.lobbyId);
+        if (lobby) {
+          if (lobby.ownerId === playerId) {
+            dissolve(player.lobbyId, playerId);
+          } else {
+            lobby.members.delete(playerId);
+            broadcastLobbyUpdate(lobby.id);
+          }
+        }
+        player.lobbyId = null;
+        player.ready   = false;
+        break;
+      }
     }
   });
-  tx(events);
 
-  scheduleBroadcast();
-  res.json({ ok: true, accepted: events.length });
+  ws.on('close', () => handleDisconnect(playerId));
+  ws.on('error', () => handleDisconnect(playerId));
 });
 
-// ---------- Live endpoint (for dashboard polling fallback) ----------
-app.get('/v1/live', adminLimiter, requireAdmin, (req, res) => {
-  res.json({ live: liveStats() });
-});
+// ─── Cleanup stale connections ───────────────────────────────────────────────
 
-// ---------- Admin auth ----------
-function requireAdmin(req, res, next) {
-  const h = req.get('Authorization') || '';
-  if (!ADMIN_TOKEN || h !== `Bearer ${ADMIN_TOKEN}`) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  next();
-}
-
-// ---------- Stats queries ----------
-function liveStats() {
-  const cutoff = Date.now() - ACTIVE_WINDOW_MS;
-  const rows = db.prepare(`
-    SELECT id, last_zone AS zone, last_map_id AS mapId
-    FROM sessions
-    WHERE last_seen >= ? AND end_ts IS NULL
-  `).all(cutoff);
-
-  const byZone = {};
-  const byMap = {};
-  for (const r of rows) {
-    const z = r.zone || 'unknown';
-    byZone[z] = (byZone[z] || 0) + 1;
-    if (r.mapId != null) byMap[r.mapId] = (byMap[r.mapId] || 0) + 1;
-  }
-  const recordRow = getMeta.get('record_concurrent');
-  const record = recordRow ? parseInt(recordRow.v, 10) : 0;
-  const totalUniques = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions`).get().n;
-
-  if (rows.length > record) setMeta.run('record_concurrent', String(rows.length));
-
-  return {
-    totalOnline: rows.length,
-    byZone,
-    byMap,
-    record: Math.max(record, rows.length),
-    totalUniques
-  };
-}
-
-function dropoffStats(rangeMs) {
-  const since = Date.now() - rangeMs;
-  const ended = db.prepare(`
-    SELECT last_zone AS zone, last_map_id AS mapId, COUNT(*) AS n
-    FROM sessions
-    WHERE COALESCE(end_ts, last_seen) >= ?
-      AND (end_ts IS NOT NULL OR last_seen < ?)
-    GROUP BY last_zone, last_map_id
-  `).all(since, Date.now() - ACTIVE_WINDOW_MS);
-
-  const byZone = {}, byMap = {};
-  for (const r of ended) {
-    if (r.zone) byZone[r.zone] = (byZone[r.zone] || 0) + r.n;
-    if (r.mapId != null) byMap[r.mapId] = (byMap[r.mapId] || 0) + r.n;
-  }
-  const toSorted = (obj) => Object.entries(obj).map(([k, v]) => ({ key: k, count: v })).sort((a, b) => b.count - a.count).slice(0, 10);
-  return { byZone: toSorted(byZone), byMap: toSorted(byMap) };
-}
-
-function concurrentHistory(rangeMs, bucketMs) {
-  const since = Date.now() - rangeMs;
-  return db.prepare(`
-    SELECT (ts / ?) * ? AS bucket, MAX(count) AS count
-    FROM concurrent_snapshots
-    WHERE ts >= ?
-    GROUP BY bucket
-    ORDER BY bucket ASC
-  `).all(bucketMs, bucketMs, since);
-}
-
-const LATEST_DASHBOARD_VERSION = process.env.DASHBOARD_LATEST_VERSION || '1.0.0';
-const DASHBOARD_RELEASE_URL = process.env.DASHBOARD_RELEASE_URL || '';
-const DASHBOARD_RELEASE_NOTES = process.env.DASHBOARD_RELEASE_NOTES || '';
-
-app.get('/v1/version', adminLimiter, requireAdmin, (req, res) => {
-  res.json({
-    latest: LATEST_DASHBOARD_VERSION,
-    url: DASHBOARD_RELEASE_URL,
-    notes: DASHBOARD_RELEASE_NOTES
-  });
-});
-
-app.get('/v1/announcement', gameLimiter, (req, res) => {
-  const authHeader = req.get('Authorization') || '';
-  const gameToken = req.get('X-Game-Token') || '';
-  const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
-  const isGame = GAME_TOKEN && gameToken === GAME_TOKEN;
-  if (!isAdmin && !isGame) return res.status(401).json({ error: 'unauthorized' });
-  res.json({ announcement: currentAnnouncement() });
-});
-
-app.post('/v1/announcement/:id/view', gameLimiter, (req, res) => {
-  const gameToken = req.get('X-Game-Token') || '';
-  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  const id = parseInt(req.params.id, 10);
-  if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
-  incrementViewCount.run(id);
-  res.json({ ok: true });
-});
-
-app.post('/v1/announcement', adminLimiter, requireAdmin, (req, res) => {
-  const body = req.body || {};
-  if (!body.title || !body.body) {
-    return res.status(400).json({ error: 'title and body are required' });
-  }
-  publishAnnouncement(body);
-  if (DISCORD_WEBHOOK_URL) {
-    const embed = {
-      embeds: [{
-        title: body.title,
-        description: body.body,
-        color: 0x9B2CB8,
-        footer: { text: 'Succubus Games — Kutushmurf' },
-        timestamp: new Date().toISOString(),
-        ...(body.url ? { url: body.url } : {}),
-      }]
-    };
-    fetch(DISCORD_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(embed),
-    }).catch(err => console.error('[webhook] Discord post failed:', err.message));
-  }
-  res.json({ ok: true, announcement: currentAnnouncement() });
-});
-
-app.delete('/v1/announcement', adminLimiter, requireAdmin, (req, res) => {
-  deactivateAnnouncements.run();
-  res.json({ ok: true });
-});
-
-// ---------- Game auto-update ----------
-app.get('/v1/game/update', gameLimiter, (req, res) => {
-  const gameToken = req.get('X-Game-Token') || '';
-  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  const row = getMeta.get('game_update_manifest');
-  if (!row) return res.json({ manifest: null });
-  try { res.json({ manifest: JSON.parse(row.v) }); }
-  catch(e) { res.json({ manifest: null }); }
-});
-
-app.post('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
-  const { manifest } = req.body || {};
-  if (!manifest || !manifest.version || !Array.isArray(manifest.files))
-    return res.status(400).json({ error: 'invalid manifest' });
-  setMeta.run('game_update_manifest', JSON.stringify(manifest));
-  res.json({ ok: true, manifest });
-});
-
-app.delete('/v1/game/update', adminLimiter, requireAdmin, (req, res) => {
-  setMeta.run('game_update_manifest', 'null');
-  res.json({ ok: true });
-});
-
-app.get('/v1/changelog', gameLimiter, (req, res) => {
-  const authHeader = req.get('Authorization') || '';
-  const gameToken = req.get('X-Game-Token') || '';
-  const isAdmin = ADMIN_TOKEN && authHeader === `Bearer ${ADMIN_TOKEN}`;
-  const isGame = GAME_TOKEN && gameToken === GAME_TOKEN;
-  if (!isAdmin && !isGame) return res.status(401).json({ error: 'unauthorized' });
-  const rows = getChangelog.all();
-  res.json({ changelog: rows.map(r => ({ id: r.id, title: r.title, body: r.body, url: r.url, version: r.version, createdAt: r.created_at })) });
-});
-
-app.get('/v1/stats/live', adminLimiter, requireAdmin, (req, res) => res.json(liveStats()));
-
-app.get('/v1/stats/today', adminLimiter, requireAdmin, (req, res) => {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-  const n = db.prepare(`SELECT COUNT(DISTINCT player_id) AS n FROM sessions WHERE start_ts >= ?`).get(startOfDay.getTime()).n;
-  res.json({ today: n });
-});
-
-app.post('/v1/report', gameLimiter, (req, res) => {
-  const gameToken = req.get('X-Game-Token') || '';
-  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  const b = req.body || {};
-  db.prepare(`INSERT INTO bug_reports (player_id, error, stack, zone, version, platform, screenshot, ts) VALUES (?,?,?,?,?,?,?,?)`).run(
-    isValidUUID(b.playerId) ? String(b.playerId) : null,
-    String(b.error      || '').slice(0, 512),
-    String(b.stack      || '').slice(0, 4096),
-    String(b.zone       || '').slice(0, 32),
-    String(b.version    || '').slice(0, 32),
-    String(b.platform   || '').slice(0, 32),
-    String(b.screenshot || '').slice(0, 200000),
-    Date.now()
-  );
-  broadcastBugReport();
-  res.json({ ok: true });
-});
-
-app.post('/v1/players/link', adminLimiter, requireAdmin, (req, res) => {
-  const { uuid, discordUsername, discordId } = req.body || {};
-  if (!uuid || !discordUsername) return res.status(400).json({ error: 'uuid and discordUsername required' });
-  if (!isValidUUID(uuid)) return res.status(400).json({ error: 'invalid uuid format' });
-  db.prepare(`INSERT OR REPLACE INTO discord_links (player_id, discord_username, discord_id, linked_at) VALUES (?, ?, ?, ?)`)
-    .run(String(uuid).slice(0, 64), String(discordUsername).slice(0, 64), discordId ? String(discordId).slice(0, 32) : null, Date.now());
-  res.json({ ok: true });
-});
-
-app.get('/v1/players/links', adminLimiter, requireAdmin, (req, res) => {
-  const rows = db.prepare(`SELECT player_id, discord_id FROM discord_links WHERE discord_id IS NOT NULL`).all();
-  res.json({ links: rows.map(r => ({ uuid: r.player_id, discordId: r.discord_id })) });
-});
-
-app.get('/v1/players/discord', gameLimiter, (req, res) => {
-  const gameToken = req.get('X-Game-Token') || '';
-  if (!GAME_TOKEN || gameToken !== GAME_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  const uuid = String(req.query.uuid || '');
-  if (!uuid) return res.status(400).json({ error: 'uuid required' });
-  if (!isValidUUID(uuid)) return res.status(400).json({ error: 'invalid uuid format' });
-  const row = db.prepare(`SELECT discord_username FROM discord_links WHERE player_id = ?`).get(uuid);
-  res.json({ username: row ? row.discord_username : null });
-});
-
-app.get('/v1/players/zones', adminLimiter, requireAdmin, (req, res) => {
-  const rows = db.prepare(`
-    SELECT player_id, last_zone FROM sessions
-    GROUP BY player_id HAVING last_seen = MAX(last_seen)
-  `).all();
-  const result = {};
-  for (const row of rows) result[row.player_id] = row.last_zone || 'unknown';
-  res.json(result);
-});
-app.get('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-  const rows = db.prepare(`SELECT id, player_id, error, stack, zone, version, platform, screenshot, ts FROM bug_reports ORDER BY ts DESC LIMIT ?`).all(limit);
-  res.json({ reports: rows });
-});
-
-app.delete('/v1/reports', adminLimiter, requireAdmin, (req, res) => {
-  db.prepare(`DELETE FROM bug_reports`).run();
-  res.json({ ok: true });
-});
-
-app.get('/v1/stats/dropoff', adminLimiter, requireAdmin, (req, res) => {
-  const range = Math.max(1, Math.min(parseInt(req.query.rangeMs || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
-  res.json(dropoffStats(range));
-});
-app.get('/v1/stats/concurrent', adminLimiter, requireAdmin, (req, res) => {
-  const range  = Math.max(1, Math.min(parseInt(req.query.rangeMs  || (24 * 3600 * 1000), 10), 90 * 24 * 3600 * 1000));
-  const bucket = Math.max(60000, Math.min(parseInt(req.query.bucketMs || (5 * 60 * 1000), 10), 24 * 3600 * 1000));
-  res.json(concurrentHistory(range, bucket));
-});
-
-// ---------- Snapshot cron ----------
-function takeSnapshot() {
-  const cutoff = Date.now() - ACTIVE_WINDOW_MS;
-  const n = db.prepare(`SELECT COUNT(*) AS n FROM sessions WHERE last_seen >= ? AND end_ts IS NULL`).get(cutoff).n;
-  db.prepare(`INSERT OR REPLACE INTO concurrent_snapshots(ts, count) VALUES (?, ?)`).run(Date.now(), n);
-  // retention 60 days
-  db.prepare(`DELETE FROM concurrent_snapshots WHERE ts < ?`).run(Date.now() - 60 * 24 * 3600 * 1000);
-}
-setInterval(takeSnapshot, 60 * 1000);
-
-// retention events 30 days
 setInterval(() => {
-  db.prepare(`DELETE FROM events WHERE ts < ?`).run(Date.now() - 30 * 24 * 3600 * 1000);
-}, 3600 * 1000);
+  const now = Date.now();
+  players.forEach((p, id) => {
+    if (now - p.lastSeen > 30000) {
+      console.log('[cleanup] removing stale player', id);
+      try { p.ws.terminate(); } catch {}
+      handleDisconnect(id);
+    }
+  });
+}, 10000);
 
-// ---------- HTTP + WS ----------
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/v1/stream' });
-
-wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, 'http://x');
-  const token = url.searchParams.get('token') || (req.headers['sec-websocket-protocol'] || '');
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
-    ws.close(4401, 'unauthorized');
-    return;
-  }
-  ws.send(JSON.stringify({ type: 'snapshot', live: liveStats() }));
-});
-
-function broadcastBugReport() {
-  const payload = JSON.stringify({ type: 'bug_report' });
-  wss.clients.forEach((c) => { if (c.readyState === 1) c.send(payload); });
-}
-
-let broadcastTimer = null;
-function scheduleBroadcast() {
-  if (broadcastTimer) return;
-  broadcastTimer = setTimeout(() => {
-    broadcastTimer = null;
-    const payload = JSON.stringify({ type: 'snapshot', live: liveStats() });
-    wss.clients.forEach((c) => { if (c.readyState === 1) c.send(payload); });
-  }, 500);
-}
-
-setInterval(() => scheduleBroadcast(), 5000); // keep clients fresh even without events
+// ─── Start ───────────────────────────────────────────────────────────────────
 
 server.listen(PORT, () => {
-  console.log(`[boot] telemetry server listening on :${PORT}`);
+  console.log('[SG-Multi] Server running on port', PORT);
+  if (!GAME_TOKEN) console.warn('[SG-Multi] WARNING: GAME_TOKEN not set — all connections accepted');
 });
