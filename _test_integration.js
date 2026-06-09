@@ -4,7 +4,6 @@
 
 process.env.PORT = '3919';
 process.env.GAME_TOKEN = 'test-token';
-process.env.FINISH_MAPS = '5,15,16,17';
 
 require('./server.js');
 
@@ -81,21 +80,25 @@ const count = (inbox, type) => inbox.filter(m => m.type === type).length;
 
   console.log('— Positions —');
   A.inbox.length = 0; B.inbox.length = 0;
-  A.send({ type: 'pos', mapId: 1, x: 10, y: 12, dir: 4, characterName: 'Actor1', characterIndex: 0 });
+  A.send({ type: 'pos', mapId: 1, x: 10, y: 12, dir: 4, progress: 42, characterName: 'Actor1', characterIndex: 0 });
   await sleep(100);
   let posB = last(B.inbox, 'positions');
   ok(posB && posB.players.some(p => p.playerId === 'player-A' && p.x === 10 && p.y === 12), 'B reçoit la position de A');
+  ok(posB && posB.players.some(p => p.playerId === 'player-A' && p.progress === 42), 'le progress de A est inclus dans positions');
   ok(last(A.inbox, 'positions'), 'echo : A reçoit aussi le snapshot (adversaire idle visible)');
 
   console.log('— Course —');
   A.inbox.length = 0; B.inbox.length = 0;
-  B.send({ type: 'pos', mapId: 5, x: 3, y: 3, dir: 2, characterName: 'Actor1', characterIndex: 1 });
+  B.send({ type: 'pos', mapId: 18, x: 3, y: 3, dir: 2, progress: 99, characterName: 'Actor1', characterIndex: 1 });
+  await sleep(100);
+  ok(!last(A.inbox, 'race_end'), 'pas de race_end à 99%');
+  B.send({ type: 'pos', mapId: 18, x: 3, y: 3, dir: 2, progress: 100, characterName: 'Actor1', characterIndex: 1 });
   await sleep(100);
   const endA = last(A.inbox, 'race_end'), endB = last(B.inbox, 'race_end');
-  ok(endA && endA.winnerId === 'player-B' && endB && endB.winnerId === 'player-B', 'race_end broadcast, vainqueur = B');
+  ok(endA && endA.winnerId === 'player-B' && endB && endB.winnerId === 'player-B', 'race_end broadcast à 100%, vainqueur = B');
 
-  B.send({ type: 'pos', mapId: 15, x: 4, y: 4, dir: 2 });
-  A.send({ type: 'pos', mapId: 5,  x: 1, y: 1, dir: 2 });
+  B.send({ type: 'pos', mapId: 18, x: 4, y: 4, dir: 2, progress: 100 });
+  A.send({ type: 'pos', mapId: 18, x: 1, y: 1, dir: 2, progress: 100 });
   await sleep(100);
   ok(count(A.inbox, 'race_end') === 1 && count(B.inbox, 'race_end') === 1, 'race_end émis une seule fois');
 

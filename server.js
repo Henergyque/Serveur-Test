@@ -6,10 +6,6 @@ const { WebSocketServer } = require('ws');
 
 const PORT       = process.env.PORT || 3001;
 const GAME_TOKEN = process.env.GAME_TOKEN || '';
-// Maps de la zone "endgame" : le premier joueur qui y arrive gagne la course.
-const FINISH_MAPS = new Set(
-  (process.env.FINISH_MAPS || '5,15,16,17').split(',').map(s => Number(s.trim())).filter(Boolean)
-);
 
 const app    = express();
 const server = http.createServer(app);
@@ -86,7 +82,7 @@ function handleDisconnect(playerId, ws) {
 
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 
-app.get('/health', (_req, res) => res.json({ ok: true, version: '1.1.0', lobbies: lobbies.size, players: players.size }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '1.2.0', lobbies: lobbies.size, players: players.size }));
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 
@@ -110,7 +106,7 @@ wss.on('connection', (ws) => {
       const old = players.get(playerId);
       players.set(playerId, {
         ws, lobbyId: null, ready: false,
-        mapId: 0, x: 0, y: 0, dir: 2,
+        mapId: 0, x: 0, y: 0, dir: 2, progress: 0,
         characterName: '', characterIndex: 0,
         lastSeen: Date.now()
       });
@@ -172,14 +168,16 @@ wss.on('connection', (ws) => {
         player.x              = Number(msg.x)              || 0;
         player.y              = Number(msg.y)              || 0;
         player.dir            = Number(msg.dir)            || 2;
+        player.progress       = Math.max(0, Math.min(100, Number(msg.progress) || 0));
         player.characterName  = String(msg.characterName  || '').slice(0, 64);
         player.characterIndex = Number(msg.characterIndex) || 0;
 
         const lobby = lobbies.get(player.lobbyId);
         if (!lobby) return;
 
-        // Course : premier joueur à atteindre la zone endgame
-        if (lobby.started && !lobby.finished && FINISH_MAPS.has(player.mapId)) {
+        // Course : le client envoie progress=100 quand le switch « Fin Démo 2 »
+        // passe ON (remise des essences à Oneira) — c'est la ligne d'arrivée.
+        if (lobby.started && !lobby.finished && player.progress >= 100) {
           lobby.finished = true;
           lobby.winnerId = playerId;
           lobby.members.forEach(pid => sendTo(pid, { type: 'race_end', winnerId: playerId }));
@@ -188,7 +186,7 @@ wss.on('connection', (ws) => {
         const positions = Array.from(lobby.members).map(pid => {
           const p = players.get(pid);
           if (!p) return null;
-          return { playerId: pid, mapId: p.mapId, x: p.x, y: p.y, dir: p.dir, characterName: p.characterName, characterIndex: p.characterIndex };
+          return { playerId: pid, mapId: p.mapId, x: p.x, y: p.y, dir: p.dir, progress: p.progress, characterName: p.characterName, characterIndex: p.characterIndex };
         }).filter(Boolean);
 
         // Envoyé à tout le monde, y compris l'envoyeur : son propre flux 20 Hz lui garantit
