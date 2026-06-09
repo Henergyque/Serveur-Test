@@ -6,6 +6,10 @@ const { WebSocketServer } = require('ws');
 
 const PORT       = process.env.PORT || 3001;
 const GAME_TOKEN = process.env.GAME_TOKEN || '';
+// Maps de la zone "endgame" : le premier joueur qui y arrive gagne la course.
+const FINISH_MAPS = new Set(
+  (process.env.FINISH_MAPS || '5,15,16,17').split(',').map(s => Number(s.trim())).filter(Boolean)
+);
 
 const app    = express();
 const server = http.createServer(app);
@@ -43,6 +47,13 @@ function broadcastLobbyUpdate(lobbyId) {
   lobby.members.forEach(pid => sendTo(pid, payload));
 }
 
+// Prévient les membres restants qu'un joueur a quitté une partie en cours
+// (en lobby, broadcastLobbyUpdate suffit ; en jeu, le client a besoin d'un signal dédié)
+function notifyPeerLeft(lobby) {
+  if (!lobby.started) return;
+  lobby.members.forEach(pid => sendTo(pid, { type: 'peer_left' }));
+}
+
 function dissolve(lobbyId, excludeId) {
   const lobby = lobbies.get(lobbyId);
   if (!lobby) return;
@@ -54,9 +65,10 @@ function dissolve(lobbyId, excludeId) {
   lobbies.delete(lobbyId);
 }
 
-function handleDisconnect(playerId) {
+function handleDisconnect(playerId, ws) {
   const player = players.get(playerId);
   if (!player) return;
+  if (ws && player.ws !== ws) return; // nouvelle connexion a pris le relais, ignorer
   if (player.lobbyId) {
     const lobby = lobbies.get(player.lobbyId);
     if (lobby) {
@@ -65,6 +77,7 @@ function handleDisconnect(playerId) {
       } else {
         lobby.members.delete(playerId);
         broadcastLobbyUpdate(lobby.id);
+        notifyPeerLeft(lobby);
       }
     }
   }
@@ -73,7 +86,7 @@ function handleDisconnect(playerId) {
 
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 
-app.get('/health', (_req, res) => res.json({ ok: true, lobbies: lobbies.size, players: players.size }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '1.1.0', lobbies: lobbies.size, players: players.size }));
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 
@@ -92,15 +105,16 @@ wss.on('connection', (ws) => {
       if (!msg.playerId) { ws.close(4002, 'missing playerId'); return; }
       playerId = String(msg.playerId).slice(0, 64);
       authed = true;
-      // If same playerId reconnects, replace old entry
+      // Si même playerId reconnecte : enregistre le nouveau d'abord, puis coupe l'ancien.
+      // handleDisconnect vérifiera le ws avant de supprimer, donc pas de race condition.
       const old = players.get(playerId);
-      if (old && old.ws !== ws) try { old.ws.terminate(); } catch {}
       players.set(playerId, {
         ws, lobbyId: null, ready: false,
         mapId: 0, x: 0, y: 0, dir: 2,
         characterName: '', characterIndex: 0,
         lastSeen: Date.now()
       });
+      if (old && old.ws !== ws) try { old.ws.terminate(); } catch {}
       return;
     }
 
@@ -113,7 +127,7 @@ wss.on('connection', (ws) => {
       case 'create_lobby': {
         if (player.lobbyId) return;
         const id = genLobbyId();
-        lobbies.set(id, { id, ownerId: playerId, members: new Set([playerId]), started: false });
+        lobbies.set(id, { id, ownerId: playerId, members: new Set([playerId]), started: false, finished: false, winnerId: null });
         player.lobbyId = id;
         player.ready   = false;
         sendTo(playerId, { type: 'lobby_created', lobbyId: id });
@@ -164,14 +178,24 @@ wss.on('connection', (ws) => {
         const lobby = lobbies.get(player.lobbyId);
         if (!lobby) return;
 
+        // Course : premier joueur à atteindre la zone endgame
+        if (lobby.started && !lobby.finished && FINISH_MAPS.has(player.mapId)) {
+          lobby.finished = true;
+          lobby.winnerId = playerId;
+          lobby.members.forEach(pid => sendTo(pid, { type: 'race_end', winnerId: playerId }));
+        }
+
         const positions = Array.from(lobby.members).map(pid => {
           const p = players.get(pid);
           if (!p) return null;
           return { playerId: pid, mapId: p.mapId, x: p.x, y: p.y, dir: p.dir, characterName: p.characterName, characterIndex: p.characterIndex };
         }).filter(Boolean);
 
+        // Envoyé à tout le monde, y compris l'envoyeur : son propre flux 20 Hz lui garantit
+        // la dernière position connue de l'adversaire même si celui-ci est inactif (menu, AFK)
+        // — sinon le ghost n'apparaît pas en arrivant sur sa map.
         lobby.members.forEach(pid => {
-          if (pid !== playerId) sendTo(pid, { type: 'positions', players: positions });
+          sendTo(pid, { type: 'positions', players: positions });
         });
         break;
       }
@@ -185,17 +209,21 @@ wss.on('connection', (ws) => {
           } else {
             lobby.members.delete(playerId);
             broadcastLobbyUpdate(lobby.id);
+            notifyPeerLeft(lobby);
           }
         }
         player.lobbyId = null;
         player.ready   = false;
         break;
       }
+
+      case 'ping':
+        break; // lastSeen déjà rafraîchi plus haut, rien d'autre à faire
     }
   });
 
-  ws.on('close', () => handleDisconnect(playerId));
-  ws.on('error', () => handleDisconnect(playerId));
+  ws.on('close', () => handleDisconnect(playerId, ws));
+  ws.on('error', () => handleDisconnect(playerId, ws));
 });
 
 // ─── Cleanup stale connections ───────────────────────────────────────────────
