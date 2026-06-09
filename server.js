@@ -82,7 +82,7 @@ function handleDisconnect(playerId, ws) {
 
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 
-app.get('/health', (_req, res) => res.json({ ok: true, version: '1.2.0', lobbies: lobbies.size, players: players.size }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '1.3.0', lobbies: lobbies.size, players: players.size }));
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 
@@ -134,9 +134,10 @@ wss.on('connection', (ws) => {
         if (player.lobbyId) return;
         const lobbyId = String(msg.lobbyId || '').toUpperCase().slice(0, 4);
         const lobby   = lobbies.get(lobbyId);
-        if (!lobby)                { sendTo(playerId, { type: 'lobby_error', message: 'Lobby introuvable.' }); return; }
-        if (lobby.members.size >= 2) { sendTo(playerId, { type: 'lobby_error', message: 'Lobby plein (max 2 joueurs).' }); return; }
-        if (lobby.started)         { sendTo(playerId, { type: 'lobby_error', message: 'Partie déjà commencée.' }); return; }
+        // code = clé de traduction côté client (err_*), message = fallback FR
+        if (!lobby)                { sendTo(playerId, { type: 'lobby_error', code: 'not_found', message: 'Lobby introuvable.' }); return; }
+        if (lobby.members.size >= 2) { sendTo(playerId, { type: 'lobby_error', code: 'full', message: 'Lobby plein (max 2 joueurs).' }); return; }
+        if (lobby.started)         { sendTo(playerId, { type: 'lobby_error', code: 'started', message: 'Partie déjà commencée.' }); return; }
         lobby.members.add(playerId);
         player.lobbyId = lobbyId;
         player.ready   = false;
@@ -154,9 +155,9 @@ wss.on('connection', (ws) => {
       case 'start': {
         const lobby = lobbies.get(player.lobbyId);
         if (!lobby || lobby.ownerId !== playerId) return;
-        if (lobby.members.size < 2) { sendTo(playerId, { type: 'lobby_error', message: 'En attente d\'un 2e joueur.' }); return; }
+        if (lobby.members.size < 2) { sendTo(playerId, { type: 'lobby_error', code: 'need_player', message: 'En attente d\'un 2e joueur.' }); return; }
         const allReady = Array.from(lobby.members).every(pid => { const p = players.get(pid); return p && p.ready; });
-        if (!allReady) { sendTo(playerId, { type: 'lobby_error', message: 'Les deux joueurs doivent être prêts.' }); return; }
+        if (!allReady) { sendTo(playerId, { type: 'lobby_error', code: 'need_ready', message: 'Les deux joueurs doivent être prêts.' }); return; }
         lobby.started = true;
         lobby.members.forEach(pid => sendTo(pid, { type: 'game_start', lobbyId: player.lobbyId }));
         break;

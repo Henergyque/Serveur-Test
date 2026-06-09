@@ -56,7 +56,8 @@ const count = (inbox, type) => inbox.filter(m => m.type === type).length;
 
   B.send({ type: 'join_lobby', lobbyId: 'ZZZZ' });
   await sleep(100);
-  ok(last(B.inbox, 'lobby_error'), 'join code invalide → lobby_error');
+  const joinErr = last(B.inbox, 'lobby_error');
+  ok(joinErr && joinErr.code === 'not_found', 'join code invalide → lobby_error code not_found');
 
   B.send({ type: 'join_lobby', lobbyId: CODE });
   await sleep(100);
@@ -66,7 +67,8 @@ const count = (inbox, type) => inbox.filter(m => m.type === type).length;
   console.log('— Start —');
   A.send({ type: 'start' });
   await sleep(100);
-  ok(last(A.inbox, 'lobby_error'), 'start sans ready → lobby_error');
+  const startErr = last(A.inbox, 'lobby_error');
+  ok(startErr && startErr.code === 'need_ready', 'start sans ready → lobby_error code need_ready');
 
   A.send({ type: 'ready' }); B.send({ type: 'ready' });
   await sleep(100);
